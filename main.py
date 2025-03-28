@@ -1,81 +1,72 @@
-from fastapi import FastAPI, HTTPException, Header, Depends
-from pydantic import BaseModel
+# main.py
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 import requests
-from typing import List, Optional
+from typing import Optional, List
 from langchain.llms.base import LLM
-from langchain.agents import initialize_agent, AgentType
-from langchain.tools import BaseTool
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
 
-app = FastAPI()
-
-# ---------------------------
-# Request Body Model
-# ---------------------------
-class PromptInput(BaseModel):
-    prompt: str
-
-# ---------------------------
-# Custom LLM using a Custom API
-# ---------------------------
+# Define a custom LLM class by subclassing LangChain's LLM.
 class CustomLLM(LLM):
-    def __init__(self, api_url: str, api_key: str):
-        self.api_url = api_url
-        self.api_key = api_key
+    # Declare the API endpoint and bearer token as fields.
+    url: str = Field(..., description="Custom LLM API endpoint")
+    bearer_token: str = Field(..., description="Bearer token for API authorization")
+
+    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        headers = {
+            "Authorization": f"Bearer {self.bearer_token}",
+            "Content-Type": "application/json"
+        }
+        # Adjust the payload as needed by your API.
+        payload = {
+            "prompt": prompt,
+            "max_tokens": 150
+        }
+        response = requests.post(self.url, json=payload, headers=headers)
+        response.raise_for_status()
+        result = response.json()
+        # Expecting the API to return JSON with a "generated_text" field.
+        return result.get("generated_text", "")
 
     @property
     def _llm_type(self) -> str:
         return "custom_llm"
 
-    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
-        headers = {"Authorization": f"Bearer {self.api_key}"}
-        payload = {"prompt": prompt}
-        response = requests.post(self.api_url, json=payload, headers=headers)
-        if response.status_code != 200:
-            raise Exception(f"LLM API call failed with status code {response.status_code}")
-        data = response.json()
-        return data.get("result", "")
+# Define the request and response models.
+class QueryRequest(BaseModel):
+    question: str
 
-# ---------------------------
-# Example Custom Tool for the Agent
-# ---------------------------
-class ReverseTool(BaseTool):
-    name = "reverse_text"
-    description = "Reverses the given input text."
+class QueryResponse(BaseModel):
+    answer: str
 
-    def _run(self, text: str) -> str:
-        return text[::-1]
+# Create the FastAPI app.
+app = FastAPI()
 
-    async def _arun(self, text: str) -> str:
-        return text[::-1]
+# Instantiate the custom LLM with your API endpoint and bearer token.
+custom_llm = CustomLLM(
+    url="https://api.yourcustomllm.com/generate",  # Replace with your API endpoint.
+    bearer_token="your_custom_llm_bearer_token"      # Replace with your bearer token.
+)
 
-# ---------------------------
-# Dependency to extract API token from request header
-# ---------------------------
-def get_api_key(x_openapi_token: str = Header(..., alias="X-OpenAPI-Token")):
-    return x_openapi_token
+# Create a prompt template to format incoming questions.
+prompt_template = PromptTemplate.from_template("Question: {question}\nAnswer:")
 
-# ---------------------------
-# FastAPI Endpoint
-# ---------------------------
-@app.post("/chat")
-def chat(input_data: PromptInput, api_key: str = Depends(get_api_key)):
+# Combine the prompt template and custom LLM into a chain.
+chain = LLMChain(llm=custom_llm, prompt=prompt_template)
+
+# Define an endpoint that accepts a question and returns the generated answer.
+@app.post("/ask", response_model=QueryResponse)
+async def ask_question(query: QueryRequest):
     try:
-        # Define your custom LLM API endpoint (update with your URL)
-        custom_api_url = "http://your-custom-llm-api/endpoint"
-        
-        # Initialize our custom LLM with the provided API token
-        custom_llm = CustomLLM(api_url=custom_api_url, api_key=api_key)
-        
-        # Set up a list of tools available to the agent (here a simple text reversal tool)
-        tools = [ReverseTool()]
-        
-        # Initialize an agent with our custom LLM and tools.
-        # Here we use the ZERO_SHOT_REACT_DESCRIPTION agent type.
-        agent = initialize_agent(tools, custom_llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True)
-        
-        # Run the agent with the input prompt.
-        agent_response = agent.run(input_data.prompt)
-        
-        return {"response": agent_response}
+        # Call the chain with the provided question.
+        result = chain.call({"question": query.question})
+        # Depending on the LangChain version, result can be a dict or a string.
+        answer = result.get("text") if isinstance(result, dict) else result
+        return QueryResponse(answer=answer)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# To run the app:
+# uvicorn main:app --reload
